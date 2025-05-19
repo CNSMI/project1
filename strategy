@@ -1,0 +1,556 @@
+/**
+ * 삼성 SDS 뉴스 수집 및 요약 시스템 (Google Apps Script · ES5 단일 파일)
+ * ─ 네이버 뉴스 Open API + GPT 요약(선택)
+ * ─ URL 중복, 도메인 필터(https://n.news.naver.com/mnews/article/…)
+ *   제목 유사도(Jaccard ≥ 0.8) 필터
+ *   ★ 제목·description·본문 중 최소 1곳에 삼성 SDS 키워드 존재 필터
+ * ─ 본문 파싱 다중 패턴 + Google Docs(제목·날짜·요약) 출력
+ */
+
+/*───────────────────────────── 설정 ────────────────────────────*/
+var CONFIG = {
+  SHEET_NAME:           '삼성SDS_뉴스',
+  COMPANY:              '삼성 SDS',
+  KEYWORDS:             ['삼성SDS','삼성 SDS','삼성에스디에스','삼성 에스디에스'],
+  DATE_FORMAT:          'yyyy-MM-dd',
+  TIME_ZONE:            'GMT+9',
+  MONTH_RANGE:          6,
+  MAX_PAGES:            10,          // 네이버 API 페이지(100건 단위) 최대
+  SUMMARY_LENGTH:       300,         // GPT 요약 길이(자)
+  MAX_COLLECT_PER_RUN:  150,         // 한 회 실행당 기사 저장 상한
+  PROGRESS_KEY:         'SAMSUNG_SDS_NEWS_PROGRESS',
+  MAX_RUNTIME_MS:       330000       // 5분 30초 (제한 – 30초 여유)
+};
+
+/*───────────────────────────── API 키 ────────────────────────────*/
+var API_KEYS = {
+  NAVER_CLIENT_ID:     PropertiesService.getScriptProperties().getProperty('NAVER_CLIENT_ID'),
+  NAVER_CLIENT_SECRET: PropertiesService.getScriptProperties().getProperty('NAVER_CLIENT_SECRET'),
+  OPENAI_API_KEY:      PropertiesService.getScriptProperties().getProperty('OPENAI_API_KEY')
+};
+
+/*╔═══════════════════════ 1. 시작 함수 ═══════════════════════╗*/
+function collectSamsungSDSNews() {
+  if (!API_KEYS.NAVER_CLIENT_ID || !API_KEYS.NAVER_CLIENT_SECRET)
+    throw new Error('네이버 Open API 키가 없습니다.');
+
+  saveProgress({
+    keyword_index: 0, page: 1, processed_urls: [],
+    is_complete: false, start_time: new Date().toISOString(),
+    last_update: new Date().toISOString(), is_new_run: true,
+    execution_count: 0
+  });
+  continueSamsungSDSNews();
+}
+
+/*╔═══════════════════════ 2. 메인 루프 ═══════════════════════╗*/
+function continueSamsungSDSNews() {
+  try {
+    var execStart = Date.now();
+    if (!API_KEYS.NAVER_CLIENT_ID || !API_KEYS.NAVER_CLIENT_SECRET)
+      throw new Error('네이버 Open API 키가 없습니다.');
+
+    var progress = loadProgress();
+    progress.execution_count = (progress.execution_count || 0) + 1;
+    saveProgress(progress);
+    if (progress.is_complete) { Logger.log('✅ 이미 완료됨'); return; }
+
+    var sheet = getSheet();
+    if (progress.is_new_run) { initSheet(true); progress.is_new_run = false; saveProgress(progress); }
+
+    /* 기존 URL·제목 → 중복 집합 */
+    var rows = sheet.getDataRange().getValues();
+    var processedUrls   = {};
+    var processedTitles = [];
+    for (var r = 1; r < rows.length; r++) {
+      if (rows[r][2]) processedUrls[rows[r][2]] = true;
+      if (rows[r][0]) processedTitles.push(rows[r][0]);
+    }
+    (progress.processed_urls || []).forEach(function (u) { processedUrls[u] = true; });
+
+    var SINCE = new Date(); SINCE.setMonth(SINCE.getMonth() - CONFIG.MONTH_RANGE);
+
+    var collectCnt = 0, kwIdx = progress.keyword_index;
+
+    /* 키워드 루프 */
+    while (kwIdx < CONFIG.KEYWORDS.length) {
+
+      if (timeAlmostOut(execStart)) { saveAndRestart(kwIdx, progress.page, processedUrls); return; }
+
+      var kw   = CONFIG.KEYWORDS[kwIdx];
+      var page = (kwIdx === progress.keyword_index) ? progress.page : 1;
+      Logger.log('🔍 (%d/%d) %s', kwIdx + 1, CONFIG.KEYWORDS.length, kw);
+
+      /* 페이지 루프 */
+      while (page <= CONFIG.MAX_PAGES) {
+
+        if (timeAlmostOut(execStart)) { saveAndRestart(kwIdx, page, processedUrls); return; }
+
+        var start = (page - 1) * 100 + 1;
+        var api   = 'https://openapi.naver.com/v1/search/news.json?query=' +
+                    encodeURIComponent('"' + kw + '"') +
+                    '&display=100&start=' + start + '&sort=date';
+
+        var items = callNaverApi(api);
+        if (!items.length) break;
+
+        var older = false, added = 0;
+        for (var i = 0; i < items.length; i++) {
+
+          if (timeAlmostOut(execStart)) { saveAndRestart(kwIdx, page, processedUrls); return; }
+
+          var it  = items[i];
+          var pub = new Date(it.pubDate);
+          if (pub < SINCE) { older = true; continue; }
+
+          var link = it.link.replace(/&amp;/g, '&');
+          if (link.indexOf('https://n.news.naver.com/mnews/article/') !== 0) continue; // 도메인 필터
+          if (processedUrls[link]) continue;                                           // URL 중복
+
+          var title = stripHtml(it.title);
+          var dup   = processedTitles.some(function (t) { return jaccardSimilarity(t, title) >= 0.8; });
+          if (dup) continue;                                                           // 제목 유사
+
+          /* 본문 & 요약 */
+          var body = fetchArticleContent(link);
+          var description = stripHtml(it.description || '');
+
+          /* ★ 삼성 SDS 키워드 포함 여부 체크 */
+          if (!containsKeyword(title) && !containsKeyword(description) && !containsKeyword(body)) {
+            continue; // 키워드가 어디에도 없으면 스킵
+          }
+
+          var summary = '';
+          if (body && body.length > 100 && API_KEYS.OPENAI_API_KEY)
+            summary = createSummaryWithGpt(title, body);
+
+          processedUrls[link] = true;
+          processedTitles.push(title);
+
+          var dateStr = Utilities.formatDate(pub, CONFIG.TIME_ZONE, CONFIG.DATE_FORMAT);
+          sheet.appendRow([title, dateStr, link, body || '', summary || '']);
+          collectCnt++; added++;
+          if (collectCnt % 5 === 0) SpreadsheetApp.flush();
+          if (collectCnt >= CONFIG.MAX_COLLECT_PER_RUN) { saveAndRestart(kwIdx, page, processedUrls); return; }
+        }
+        Logger.log('   · page %d ► 저장 %d / 누적 %d', page, added, collectCnt);
+        if (older || added === 0) break;
+        page++;
+      }
+
+      kwIdx++;
+      saveProgress({
+        keyword_index: kwIdx, page: 1,
+        processed_urls: Object.keys(processedUrls),
+        is_complete: false,
+        start_time: progress.start_time,
+        last_update: new Date().toISOString(),
+        is_new_run: false,
+        execution_count: progress.execution_count
+      });
+    }
+
+    /* 완료 저장 */
+    saveProgress({
+      keyword_index: kwIdx, page: 1,
+      processed_urls: Object.keys(processedUrls),
+      is_complete: true,
+      start_time: progress.start_time,
+      end_time: new Date().toISOString(),
+      last_update: new Date().toISOString(),
+      is_new_run: false,
+      execution_count: progress.execution_count
+    });
+    Logger.log('✅ 완료 – 총 %d 기사', collectCnt);
+
+  } catch (e) {
+    Logger.log('❌ 오류: ' + e.message); Logger.log(e.stack);
+    createAutoRestartTrigger();
+  }
+}
+
+/*────────────────────────── 3. 유틸 함수 ──────────────────────────*/
+function timeAlmostOut(stamp) { return (Date.now() - stamp) > (CONFIG.MAX_RUNTIME_MS - 30000); }
+
+function saveAndRestart(kwIdx, page, urlObj) {
+  saveProgress({
+    keyword_index: kwIdx, page: page,
+    processed_urls: Object.keys(urlObj),
+    is_complete: false,
+    start_time: loadProgress().start_time,
+    last_update: new Date().toISOString(),
+    is_new_run: false,
+    execution_count: loadProgress().execution_count
+  });
+  createAutoRestartTrigger();
+}
+
+/* 네이버 API 호출 */
+function callNaverApi(url) {
+  var res = UrlFetchApp.fetch(url, {
+    headers: {
+      'X-Naver-Client-Id':     API_KEYS.NAVER_CLIENT_ID,
+      'X-Naver-Client-Secret': API_KEYS.NAVER_CLIENT_SECRET
+    },
+    muteHttpExceptions: true
+  });
+  if (res.getResponseCode() !== 200) { Logger.log('네이버 API 오류 ' + res.getResponseCode()); return []; }
+  return JSON.parse(res.getContentText()).items || [];
+}
+
+/* 자카드 유사도 */
+function jaccardSimilarity(a, b) {
+  function tok(s) {
+    return s.replace(/[^가-힣A-Za-z0-9\s]/g, ' ')
+            .toLowerCase()
+            .split(/\s+/)
+            .filter(function (w) { return w.length > 1; });
+  }
+  var A = tok(a), B = tok(b);
+  if (!A.length || !B.length) return 0;
+  var setA = {}; A.forEach(function (t) { setA[t] = true; });
+  var inter = 0; B.forEach(function (t) { if (setA[t]) inter++; });
+  var union = A.concat(B).filter(function (v, i, arr) { return arr.indexOf(v) === i; }).length;
+  return inter / union;
+}
+
+/* HTML 태그 제거 */
+function stripHtml(html) {
+  if (!html) return '';
+  return html.replace(/<[^>]*>/g, ' ')
+             .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+             .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+             .replace(/&nbsp;/g, ' ')
+             .replace(/\s+/g, ' ')
+             .trim();
+}
+
+/* ★ 키워드 포함 여부 검사 */
+function containsKeyword(text) {
+  if (!text) return false;
+  for (var i = 0; i < CONFIG.KEYWORDS.length; i++) {
+    if (text.indexOf(CONFIG.KEYWORDS[i]) !== -1) return true;
+  }
+  return false;
+}
+
+/* ── 네이버 뉴스 본문 크롤링 (다중 패턴) ── */
+function fetchArticleContent(url) {
+  if (!url || url.indexOf('https://n.news.naver.com/mnews/article/') !== 0) return null;
+
+  try {
+    var html = UrlFetchApp.fetch(url, {
+      muteHttpExceptions: true,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+    }).getContentText();
+
+    var patterns = [
+      /<div[^>]+id="dic_area"[^>]*>([\s\S]*?)<\/div>/i,
+      /<article[^>]+id="dic_area"[^>]*>([\s\S]*?)<\/article>/i,
+      /<div class="newsct_article"[^>]*>([\s\S]*?)<\/div>/i,
+      /<div class="newsct_body"[^>]*>([\s\S]*?)<\/div>/i,
+      /<div class="article_body_contents"[^>]*>([\s\S]*?)<\/div>/i,
+      /<div class="article_body"[^>]*>([\s\S]*?)<\/div>/i,
+      /<article[^>]+class="story_body"[^>]*>([\s\S]*?)<\/article>/i,
+      /<section[^>]+class="article_body"[^>]*>([\s\S]*?)<\/section>/i
+    ];
+
+    for (var i = 0; i < patterns.length; i++) {
+      var m = html.match(patterns[i]);
+      if (m && m[1]) {
+        var txt = stripHtml(m[1]).replace(/\(사진=[^)]+\)/g, '')
+                                 .replace(/▶.*?◀/g, '')
+                                 .replace(/\s+/g, ' ')
+                                 .trim();
+        if (txt.length > 100) return txt;
+      }
+    }
+
+    var meta = html.match(/<meta[^>]+property="og:description"[^>]+content="([^"]+)"/i) ||
+               html.match(/<meta[^>]+name="description"[^>]+content="([^"]+)"/i);
+    if (meta && meta[1]) return meta[1].trim();
+
+    return null;
+  } catch (e) {
+    Logger.log('본문 크롤링 오류: ' + e.message);
+    return null;
+  }
+}
+
+/* GPT 요약(선택) */
+function createSummaryWithGpt(title, body) {
+  if (!API_KEYS.OPENAI_API_KEY) return '';
+  try {
+    var prompt = '다음 기사 제목과 본문을 ' + CONFIG.SUMMARY_LENGTH +
+                 '자 이내, 2~3문장으로 한국어 요약:\n\n제목: ' + title + '\n본문:\n' +
+                 body.slice(0, 2000);
+    var res = UrlFetchApp.fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'post',
+      headers: { Authorization: 'Bearer ' + API_KEYS.OPENAI_API_KEY },
+      contentType: 'application/json',
+      payload: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.2,
+        max_tokens: CONFIG.SUMMARY_LENGTH
+      }),
+      muteHttpExceptions: true
+    });
+    if (res.getResponseCode() !== 200) return '';
+    return JSON.parse(res.getContentText()).choices[0].message.content.trim();
+  } catch (e) { return ''; }
+}
+
+/* 진행 상태 저장/로드 */
+function saveProgress(obj) {
+  PropertiesService.getScriptProperties()
+    .setProperty(CONFIG.PROGRESS_KEY, JSON.stringify(obj));
+}
+function loadProgress() {
+  var json = PropertiesService.getScriptProperties()
+              .getProperty(CONFIG.PROGRESS_KEY);
+  if (!json) return {
+    keyword_index:0,page:1,processed_urls:[],is_complete:false,
+    start_time:new Date().toISOString(),last_update:new Date().toISOString(),
+    is_new_run:true,execution_count:0
+  };
+  return JSON.parse(json);
+}
+
+/* 자동 재시작 트리거 */
+function createAutoRestartTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'continueSamsungSDSNews' &&
+        t.getTriggerSource()  === ScriptApp.TriggerSource.CLOCK)
+      ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('continueSamsungSDSNews')
+           .timeBased().after(1000).create();
+  Logger.log('⏱️ 1초 후 자동 재시작 트리거 설정');
+}
+
+/* 시트 초기화/가져오기 */
+function initSheet(forceNew) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(CONFIG.SHEET_NAME);
+  if (forceNew && sh) sh.clear();
+  if (!sh) sh = ss.insertSheet(CONFIG.SHEET_NAME);
+
+  var head = ['제목','날짜','링크','본문','요약'];
+  sh.getRange(1,1,1,5).setValues([head]);
+  sh.getRange('A1:E1').setBackground('#f3f3f3').setFontWeight('bold');
+  sh.setColumnWidths(1,5,250);
+}
+function getSheet() {
+  var   ss = SpreadsheetApp.getActiveSpreadsheet();
+  var   sh = ss.getSheetByName(CONFIG.SHEET_NAME);
+  if (!sh) { initSheet(false); sh = ss.getSheetByName(CONFIG.SHEET_NAME); }
+  return sh;
+}
+
+/* 진행 상태 간단 출력 */
+function displayProgressStatus() { Logger.log(JSON.stringify(loadProgress(),null,2)); }
+
+/* Google Docs: 제목·날짜·요약 */
+/* Google Docs: 제목·날짜·본문
+   ─ GPT 요약 & GPT 중복 판정 */
+
+/* ───────────────────────── 공통: 임베딩 유틸 ───────────────────────── */
+var EMBED_MODEL   = 'text-embedding-3-small';  // 가장 저렴한 1536-d 모델
+var EMBED_THRESH  = 0.80;                      // 유사도 임계값
+
+function getEmbedding(text) {
+  // Apps Script: UrlFetchApp 는 동기 호출이므로 기사 수가 아주 많으면 오래 걸릴 수 있음
+  var res = UrlFetchApp.fetch('https://api.openai.com/v1/embeddings', {
+    method: 'post',
+    headers: { Authorization: 'Bearer ' + API_KEYS.OPENAI_API_KEY },
+    contentType: 'application/json',
+    payload: JSON.stringify({
+      model: EMBED_MODEL,
+      input: text
+    }),
+    muteHttpExceptions: true
+  });
+  if (res.getResponseCode() !== 200)
+    throw new Error('임베딩 API 오류: ' + res.getContentText());
+  return JSON.parse(res).data[0].embedding;   // 숫자 배열(1536)
+}
+
+function cosineSim(v1, v2) {
+  var dot = 0, n1 = 0, n2 = 0;
+  for (var i = 0; i < v1.length; i++) {
+    dot += v1[i] * v2[i];
+    n1  += v1[i] * v1[i];
+    n2  += v2[i] * v2[i];
+  }
+  return dot / (Math.sqrt(n1) * Math.sqrt(n2));
+}
+
+/* ─────────────────── Google Docs: 제목·날짜·본문 ─────────────────── */
+function exportToGoogleDocs() {
+
+  var sheet = getSheet();
+  var data  = sheet.getDataRange().getValues();
+  if (data.length <= 1) {
+    SpreadsheetApp.getUi().alert('내보낼 데이터가 없습니다. 먼저 수집하세요.');
+    return;
+  }
+  if (!API_KEYS.OPENAI_API_KEY) {
+    SpreadsheetApp.getUi().alert('OPENAI_API_KEY가 없습니다.');
+    return;
+  }
+
+  /* 새 문서 */
+  var docTitle = CONFIG.COMPANY + ' 뉴스 모음 - ' +
+                 Utilities.formatDate(new Date(), CONFIG.TIME_ZONE, CONFIG.DATE_FORMAT);
+  var doc  = DocumentApp.create(docTitle);
+  var body = doc.getBody();
+  body.appendParagraph(docTitle)
+      .setHeading(DocumentApp.ParagraphHeading.HEADING1);
+
+  /* 시트 → 최신 날짜순 정렬 */
+  var rows = data.slice(1)
+                 .sort(function (a, b) { return new Date(b[1]) - new Date(a[1]); });
+
+  /* 이미 추가한 기사들의 임베딩 저장소 */
+  var acceptedEmbeds = [];
+  var addedCnt = 0;
+
+  rows.forEach(function (r) {
+
+    var title   = r[0];     // A 열
+    var dateStr = r[1];     // B 열
+    var link    = r[2];     // C 열
+    var article = r[3] || ''; // D 열 (본문)
+
+    /* 1) 새 기사 임베딩 생성 */
+    var embNew;
+    try {
+      // 임베딩 입력은 긴 본문보단 '제목 + 앞부분 500자' 정도가 효율적
+      embNew = getEmbedding((title + ' ' + article.slice(0, 500)).trim());
+    } catch (e) {
+      Logger.log(e.message);
+      return; // 임베딩 실패 시 해당 기사 스킵
+    }
+
+    /* 2) 기존 기사와 코사인 유사도 비교 → 중복 여부 */
+    var isDup = acceptedEmbeds.some(function (e) {
+      return cosineSim(e, embNew) >= EMBED_THRESH;
+    });
+    if (isDup) return;   // 유사하면 건너뜀
+
+    /* 3) Google Docs에 기록 (제목·날짜·본문) */
+    body.appendParagraph('▶ ' + dateStr + ' — ' + title)
+        .setHeading(DocumentApp.ParagraphHeading.HEADING3);
+
+    if (link) {
+      body.appendParagraph(link)
+          .setLinkUrl(link)
+          .setAttributes({ [DocumentApp.Attribute.FONT_SIZE]: 9 });
+    }
+
+    body.appendParagraph(article || '(본문 없음)')
+        .setAttributes({ [DocumentApp.Attribute.FONT_SIZE]: 11 });
+
+    body.appendHorizontalRule();
+
+    /* 4) 임베딩 저장 */
+    acceptedEmbeds.push(embNew);
+    addedCnt++;
+  });
+
+  doc.saveAndClose();
+  SpreadsheetApp.getUi()
+    .alert('Docs 생성 완료 (새 기사 ' + addedCnt + '건)\n' + doc.getUrl());
+}
+
+
+
+/*╔══════════════════════ 4. 메뉴·트리거 ══════════════════════╗*/
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('뉴스 수집')
+    .addItem('수집 시작','collectSamsungSDSNews')
+    .addItem('이어 진행','continueSamsungSDSNews')
+    .addSeparator()
+    .addItem('Docs로 내보내기','exportToGoogleDocs')
+    .addSeparator()
+    .addItem('진행 상태 보기','displayProgressStatus')
+    .addSeparator()
+    .addItem('매일 9시 자동 실행 설정','setupDailyTrigger')
+    .addItem('자동 실행 중지','removeTriggers')
+    .addToUi();
+}
+function setupDailyTrigger() {
+  removeTriggers();
+  ScriptApp.newTrigger('continueSamsungSDSNews')
+           .timeBased().atHour(9).everyDays(1).create();
+}
+function removeTriggers() {
+  ScriptApp.getProjectTriggers().forEach(function(t){
+    if (t.getHandlerFunction()==='continueSamsungSDSNews')
+      ScriptApp.deleteTrigger(t);
+  });
+}
+
+/**
+ * 전일 8시 ~ 당일 8시까지의 삼성 SDS 뉴스 기사만 Google Docs에 내보내는 함수
+ * 매일 오전 8시에 실행되도록 트리거 설정 필요
+ */
+function exportDailyNewsToGoogleDocs() {
+  var sheet = getSheet();
+  var data = sheet.getDataRange().getValues();
+  if (data.length <= 1) return;
+
+  var now = new Date();
+  var end = new Date(now);
+  end.setHours(8, 0, 0, 0);
+
+  var start = new Date(end);
+  start.setDate(start.getDate() - 1);
+
+  var docTitle = CONFIG.COMPANY + ' 뉴스 모음 - ' +
+                 Utilities.formatDate(start, CONFIG.TIME_ZONE, CONFIG.DATE_FORMAT);
+  var doc = DocumentApp.create(docTitle);
+  var body = doc.getBody();
+
+  body.appendParagraph(docTitle).setHeading(DocumentApp.ParagraphHeading.HEADING1);
+
+  var acceptedEmbeds = [];
+  var addedCnt = 0;
+
+  data.slice(1).forEach(function (r) {
+    var title = r[0], dateStr = r[1], link = r[2], article = r[3] || '';
+    var pubDate = new Date(dateStr);
+
+    if (pubDate >= start && pubDate < end) {
+      try {
+        var embNew = getEmbedding((title + ' ' + article.slice(0, 500)).trim());
+        var isDup = acceptedEmbeds.some(function (e) {
+          return cosineSim(e, embNew) >= EMBED_THRESH;
+        });
+        if (isDup) return;
+
+        body.appendParagraph('▶ ' + dateStr + ' — ' + title)
+            .setHeading(DocumentApp.ParagraphHeading.HEADING3);
+
+        if (link) {
+          body.appendParagraph(link).setLinkUrl(link)
+              .setAttributes({ [DocumentApp.Attribute.FONT_SIZE]: 9 });
+        }
+
+        body.appendParagraph(article || '(본문 없음)')
+            .setAttributes({ [DocumentApp.Attribute.FONT_SIZE]: 11 });
+
+        body.appendHorizontalRule();
+        acceptedEmbeds.push(embNew);
+        addedCnt++;
+      } catch (e) {
+        Logger.log(e.message);
+      }
+    }
+  });
+
+  doc.saveAndClose();
+  Logger.log('Docs 생성 완료 (신규 기사 ' + addedCnt + '건): ' + doc.getUrl());
+}
